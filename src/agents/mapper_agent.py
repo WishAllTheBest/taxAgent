@@ -1,10 +1,26 @@
-from pydantic import BaseModel, Field
-from typing import List, Optional
+import logging
+from dataclasses import dataclass
+from typing import Any, List
 
-class RecommendationResult(BaseModel):
-    tax_code: str = Field(description="推荐的税务类目编码")
-    confidence: float = Field(description="置信度 0-1")
-    reasoning: str = Field(description="大模型推荐的思维链和原因")
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RecommendationResult:
+    tax_code: str
+    confidence: float
+    reasoning: str
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, Any]) -> "RecommendationResult":
+        tax_code = str(payload.get("tax_code", "")).strip()
+        if not tax_code:
+            raise ValueError("recommendation missing tax_code")
+
+        confidence = float(payload.get("confidence", 0.0))
+        confidence = max(0.0, min(1.0, confidence))
+        reasoning = str(payload.get("reasoning", "未提供推荐说明。")).strip()
+        return cls(tax_code=tax_code, confidence=confidence, reasoning=reasoning)
 
 class MapperAgent:
     def __init__(self, llm_client, rag_engine):
@@ -15,8 +31,11 @@ class MapperAgent:
         """
         基于业务类目信息和RAG系统进行税务类目的智能推荐
         """
-        name = business_item.get('name', '')
-        desc = business_item.get('desc', '')
+        name = str(business_item.get('name') or '').strip()
+        desc = str(business_item.get('desc') or '').strip()
+        if not name:
+            logger.warning("跳过缺少 name 的业务类目: %s", business_item)
+            return []
         
         # 1. 从知识库中检索税务政策及正反样本
         context = self.rag_engine.retrieve_context(f"{name} {desc}")
@@ -33,7 +52,8 @@ class MapperAgent:
         名称: {name}
         描述: {desc}
         
-        请进行深度推理分析该商品的属性与税法条款的匹配度，并输出结果。
+        请给出简洁、可审计的匹配依据，并输出 recommendations JSON：
+        {{"recommendations":[{{"tax_code":"...","confidence":0.0,"reasoning":"..."}}]}}
         """
         
         # 如果提供了真实的 LLM client，则调用之；否则使用 Mock 回退
@@ -45,8 +65,12 @@ class MapperAgent:
                 if isinstance(response, dict) and response.get('recommendations'):
                     results = []
                     for r in response['recommendations']:
-                        results.append(RecommendationResult(**r))
-                    return results
+                        try:
+                            results.append(RecommendationResult.from_mapping(r))
+                        except (TypeError, ValueError) as exc:
+                            logger.warning("忽略格式不合法的推荐结果 %s: %s", r, exc)
+                    if results:
+                        return sorted(results, key=lambda item: item.confidence, reverse=True)
                 else:
                     # 简单解析文本返回：取首个推荐并给出中等置信度
                     text = str(response)
@@ -59,7 +83,7 @@ class MapperAgent:
                     ]
         except Exception:
             # 网络或解析出错时，降级到 Mock 策略
-            pass
+            logger.exception("LLM 推荐调用失败，降级到本地规则")
 
         # Mock 默认返回，用于单元测试或本地离线运行
         return [
